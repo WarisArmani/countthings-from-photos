@@ -5,7 +5,12 @@ import time
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageOps, ImageDraw, UnidentifiedImageError
+from PIL import (
+    Image,
+    ImageOps,
+    ImageDraw,
+    UnidentifiedImageError,
+)
 from huggingface_hub import hf_hub_download
 
 
@@ -25,6 +30,17 @@ TILE_SIZE = 640
 TILE_OVERLAP = 0.25
 INFERENCE_SIZE = 960
 
+# Stricter confidence helps reduce false detections.
+DEFAULT_CONFIDENCE = 0.45
+
+# IoU used by YOLO during inference.
+MODEL_IOU = 0.45
+
+# IoU used to merge detections across overlapping tiles.
+DUPLICATE_IOU = 0.40
+
+MAX_DETECTIONS_PER_TILE = 500
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="👥",
@@ -35,18 +51,18 @@ st.title("Classroom Head Counter")
 
 st.write(
     "Upload a classroom photo to detect and count visible heads. "
-    "The app analyzes overlapping sections to help find smaller "
-    "heads in the back rows."
+    "The photo is analyzed in overlapping sections to help detect "
+    "smaller heads in the back rows."
 )
 
 st.info(
-    "This is an estimated count. Please check the marked image "
-    "for missed heads and false detections."
+    "The app uses a dedicated head-detection model. Review the "
+    "green boxes to identify false detections and missed heads."
 )
 
 
 # =========================================================
-# LOAD THE HEAD-SPECIFIC MODEL
+# LOAD MODEL
 # =========================================================
 
 @st.cache_resource(show_spinner=False)
@@ -60,10 +76,8 @@ def load_model():
 
     model = YOLO(model_path)
 
-    # IMPORTANT:
-    # Do not assign to model.names.
-    # Ultralytics manages this read-only property.
-    # Preserve the original class names stored in the model.
+    # Do not assign model.names.
+    # The checkpoint's class 0 represents a human head.
 
     return model
 
@@ -81,8 +95,8 @@ def read_image(raw_bytes):
 
         if width * height > MAX_IMAGE_PIXELS:
             raise ValueError(
-                "The image is too large. Please upload an image "
-                "with no more than 25 million pixels."
+                "The image exceeds 25 million pixels. "
+                "Please upload a smaller image."
             )
 
         return ImageOps.exif_transpose(source).convert("RGB")
@@ -149,29 +163,14 @@ def make_tiles(image):
 
 
 # =========================================================
-# DUPLICATE DETECTION REMOVAL
+# CALCULATE BOX OVERLAP
 # =========================================================
 
 def calculate_iou(box, other_boxes):
-    x1 = np.maximum(
-        box[0],
-        other_boxes[:, 0],
-    )
-
-    y1 = np.maximum(
-        box[1],
-        other_boxes[:, 1],
-    )
-
-    x2 = np.minimum(
-        box[2],
-        other_boxes[:, 2],
-    )
-
-    y2 = np.minimum(
-        box[3],
-        other_boxes[:, 3],
-    )
+    x1 = np.maximum(box[0], other_boxes[:, 0])
+    y1 = np.maximum(box[1], other_boxes[:, 1])
+    x2 = np.minimum(box[2], other_boxes[:, 2])
+    y2 = np.minimum(box[3], other_boxes[:, 3])
 
     intersection = (
         np.maximum(0, x2 - x1)
@@ -197,38 +196,31 @@ def calculate_iou(box, other_boxes):
 
     union = area_box + area_other - intersection
 
-    return intersection / np.maximum(
-        union,
-        1e-9,
-    )
+    return intersection / np.maximum(union, 1e-9)
 
+
+# =========================================================
+# REMOVE DUPLICATE BOXES
+# =========================================================
 
 def remove_duplicates(
     boxes,
     scores,
-    iou_threshold=0.45,
+    iou_threshold=DUPLICATE_IOU,
 ):
     if len(boxes) == 0:
         return []
 
-    boxes = np.asarray(
-        boxes,
-        dtype=np.float32,
-    )
+    boxes = np.asarray(boxes, dtype=np.float32)
+    scores = np.asarray(scores, dtype=np.float32)
 
-    scores = np.asarray(
-        scores,
-        dtype=np.float32,
-    )
-
+    # Process the most confident detections first.
     order = np.argsort(scores)[::-1]
-
     kept = []
 
     while len(order):
-        current = order[0]
-
-        kept.append(int(current))
+        current = int(order[0])
+        kept.append(current)
 
         if len(order) == 1:
             break
@@ -240,6 +232,8 @@ def remove_duplicates(
             boxes[remaining],
         )
 
+        # Discard lower-confidence boxes that substantially
+        # overlap an already accepted detection.
         order = remaining[
             overlaps < iou_threshold
         ]
@@ -248,7 +242,7 @@ def remove_duplicates(
 
 
 # =========================================================
-# RUN DETECTION ON TILES
+# DETECT HEADS
 # =========================================================
 
 def detect_heads(
@@ -272,15 +266,16 @@ def detect_heads(
             source=np.asarray(tile),
             imgsz=INFERENCE_SIZE,
             conf=float(confidence),
-            iou=0.60,
-            max_det=500,
+            iou=MODEL_IOU,
+            max_det=MAX_DETECTIONS_PER_TILE,
+            classes=[0],
             device="cpu",
             verbose=False,
         )[0]
 
         if (
             prediction.boxes is not None
-            and len(prediction.boxes)
+            and len(prediction.boxes) > 0
         ):
             tile_boxes = (
                 prediction.boxes.xyxy.cpu().numpy()
@@ -290,43 +285,38 @@ def detect_heads(
                 prediction.boxes.conf.cpu().numpy()
             )
 
-            for box, score in zip(
+            tile_classes = (
+                prediction.boxes.cls.cpu().numpy().astype(int)
+            )
+
+            for box, score, class_id in zip(
                 tile_boxes,
                 tile_scores,
+                tile_classes,
             ):
-                x1, y1, x2, y2 = map(
-                    float,
-                    box,
-                )
+                # Only accept the model's head class.
+                if class_id != 0:
+                    continue
 
-                # Convert tile coordinates to
-                # original-image coordinates.
+                # Reject any detection below the requested
+                # confidence threshold.
+                if float(score) < confidence:
+                    continue
+
+                x1, y1, x2, y2 = map(float, box)
+
+                # Convert tile coordinates into coordinates
+                # relative to the original image.
                 x1 += offset_x
                 x2 += offset_x
-
                 y1 += offset_y
                 y2 += offset_y
 
-                # Keep coordinates inside the image.
-                x1 = max(
-                    0,
-                    min(x1, image.width),
-                )
-
-                x2 = max(
-                    0,
-                    min(x2, image.width),
-                )
-
-                y1 = max(
-                    0,
-                    min(y1, image.height),
-                )
-
-                y2 = max(
-                    0,
-                    min(y2, image.height),
-                )
+                # Clip coordinates to image boundaries.
+                x1 = max(0, min(x1, image.width))
+                x2 = max(0, min(x2, image.width))
+                y1 = max(0, min(y1, image.height))
+                y2 = max(0, min(y2, image.height))
 
                 if x2 <= x1 or y2 <= y1:
                     continue
@@ -335,9 +325,7 @@ def detect_heads(
                     [x1, y1, x2, y2]
                 )
 
-                all_scores.append(
-                    float(score)
-                )
+                all_scores.append(float(score))
 
         progress_bar.progress(
             (tile_index + 1) / len(tiles),
@@ -347,21 +335,19 @@ def detect_heads(
             ),
         )
 
-    # Remove duplicate detections created by
-    # overlapping tiles.
+    # Remove duplicate detections across overlapping tiles.
     kept_indices = remove_duplicates(
         all_boxes,
         all_scores,
-        iou_threshold=0.45,
+        iou_threshold=DUPLICATE_IOU,
     )
 
     annotated = image.copy()
-
     draw = ImageDraw.Draw(annotated)
 
+    # Draw only the retained detections.
     for index in kept_indices:
         x1, y1, x2, y2 = all_boxes[index]
-
         score = all_scores[index]
 
         draw.rectangle(
@@ -375,24 +361,28 @@ def detect_heads(
             width=3,
         )
 
+        label = f"Head {score:.2f}"
+
+        text_y = max(0, int(y1) - 18)
+
         draw.text(
-            (
-                int(x1) + 2,
-                max(0, int(y1) - 16),
-            ),
-            f"Head {score:.2f}",
+            (int(x1) + 2, text_y),
+            label,
             fill="#00FF00",
+            stroke_width=1,
+            stroke_fill="#000000",
         )
 
     return (
         len(kept_indices),
         annotated,
         len(tiles),
+        len(all_boxes),
     )
 
 
 # =========================================================
-# SETTINGS
+# SIDEBAR SETTINGS
 # =========================================================
 
 with st.sidebar:
@@ -400,44 +390,37 @@ with st.sidebar:
 
     confidence = st.slider(
         "Confidence threshold",
-        min_value=0.10,
-        max_value=0.80,
-        value=0.30,
+        min_value=0.20,
+        max_value=0.85,
+        value=DEFAULT_CONFIDENCE,
         step=0.05,
         help=(
-            "Increase the threshold to reduce false detections. "
-            "Decrease it if the model misses visible heads."
+            "Higher values usually reduce false detections but "
+            "may miss genuine heads. Lower values can find more "
+            "heads but may also detect incorrect objects."
         ),
     )
 
     st.caption(
-        "Start at 0.30. Compare 0.20, 0.30, and 0.40 "
-        "on the same manually counted photo."
+        "Start at 0.45. If false detections remain, compare "
+        "0.50, 0.55, and 0.60 on the same photo."
     )
+
+    st.divider()
 
     st.write("**Image processing**")
-
-    st.write(
-        f"Tile size: {TILE_SIZE} × {TILE_SIZE}"
-    )
-
-    st.write(
-        f"Tile overlap: {int(TILE_OVERLAP * 100)}%"
-    )
+    st.write(f"Tile size: {TILE_SIZE} × {TILE_SIZE}")
+    st.write(f"Tile overlap: {int(TILE_OVERLAP * 100)}%")
+    st.write(f"Inference size: {INFERENCE_SIZE}")
 
 
 # =========================================================
-# UPLOAD
+# UPLOAD IMAGE
 # =========================================================
 
 uploaded = st.file_uploader(
     "Upload classroom photo",
-    type=[
-        "jpg",
-        "jpeg",
-        "png",
-        "webp",
-    ],
+    type=["jpg", "jpeg", "png", "webp"],
     help="Maximum file size: 20 MB.",
 )
 
@@ -448,9 +431,7 @@ if uploaded is not None:
     raw_bytes = uploaded.getvalue()
 
     if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-        st.error(
-            "The uploaded file exceeds 20 MB."
-        )
+        st.error("The uploaded file exceeds 20 MB.")
 
     else:
         try:
@@ -492,10 +473,7 @@ if st.button(
     use_container_width=True,
     disabled=image is None,
 ):
-    st.session_state.pop(
-        "head_result",
-        None,
-    )
+    st.session_state.pop("head_result", None)
 
     progress = st.progress(
         0,
@@ -504,14 +482,18 @@ if st.button(
 
     try:
         with st.spinner(
-            "Loading the head-detection model "
-            "and analyzing the photo..."
+            "Loading the model and analyzing the photo..."
         ):
             model = load_model()
 
             start_time = time.perf_counter()
 
-            count, annotated, tile_count = detect_heads(
+            (
+                count,
+                annotated,
+                tile_count,
+                raw_detection_count,
+            ) = detect_heads(
                 model=model,
                 image=image,
                 confidence=confidence,
@@ -528,18 +510,13 @@ if st.button(
                 "confidence": float(confidence),
                 "elapsed": float(elapsed),
                 "tiles": int(tile_count),
-                "annotated": to_jpeg_bytes(
-                    annotated
-                ),
-                "filename": uploaded.name.rsplit(
-                    ".",
-                    1,
-                )[0],
+                "raw_detections": int(raw_detection_count),
+                "annotated": to_jpeg_bytes(annotated),
+                "filename": uploaded.name.rsplit(".", 1)[0],
             }
 
     except Exception as error:
         st.error("Head detection failed.")
-
         st.exception(error)
 
     finally:
@@ -547,12 +524,10 @@ if st.button(
 
 
 # =========================================================
-# SHOW RESULTS
+# DISPLAY RESULTS
 # =========================================================
 
-result = st.session_state.get(
-    "head_result"
-)
+result = st.session_state.get("head_result")
 
 if (
     result is not None
@@ -560,7 +535,6 @@ if (
     and result["digest"] == image_digest
 ):
     st.divider()
-
     st.subheader("Detection results")
 
     col1, col2, col3 = st.columns(3)
@@ -581,8 +555,9 @@ if (
     )
 
     st.caption(
-        f'Image analyzed in {result["tiles"]} '
-        f'overlapping tiles.'
+        f'Analyzed {result["tiles"]} overlapping tiles. '
+        f'Combined detections before duplicate removal: '
+        f'{result["raw_detections"]}.'
     )
 
     original_col, result_col = st.columns(2)
@@ -590,7 +565,7 @@ if (
     with original_col:
         st.image(
             image,
-            caption="Original image",
+            caption="Original classroom photo",
             use_container_width=True,
         )
 
@@ -612,10 +587,9 @@ if (
     )
 
     st.warning(
-        "Review the boxes before using this count for "
-        "attendance. A box can still be a false detection, "
-        "and some heads may be missed even with this "
-        "dedicated model."
+        "Please review the boxes before using the count for "
+        "attendance. Confidence filtering and duplicate removal "
+        "cannot guarantee that every detection is a real head."
     )
 
 
