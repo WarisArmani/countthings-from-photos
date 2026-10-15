@@ -1,3 +1,7 @@
+uploaded_file = st.file_uploader(
+    "Choose a photo",
+    type=["jpg", "jpeg", "png", "webp"],
+    help=f"Maximum file size: {MAX_UPLOAD_MB} MB. Supported formats: JPG, PNG, and WEBP.",
 )
 
 image: Image.Image | None = None
