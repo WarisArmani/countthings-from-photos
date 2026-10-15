@@ -1,440 +1,115 @@
-from __future__ import annotations
-
-import hashlib
-import io
-import time
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-import streamlit as st
-from huggingface_hub import hf_hub_download
-from PIL import Image, ImageOps, UnidentifiedImageError
-
-
-# ============================================================
-# APPLICATION SETTINGS
-# ============================================================
-
-APP_TITLE = "Human Head Counter"
-
-MODEL_REPO = "AmineSam/irail-crowd-counting-yolov8n"
-MODEL_FILE = "best.pt"
-
-MODEL_IMAGE_SIZE = 832
-MODEL_IOU = 0.75
-MAX_DETECTIONS = 300
-
-MAX_UPLOAD_MB = 20
-MAX_IMAGE_PIXELS = 25_000_000
-
-
-# ============================================================
-# STREAMLIT PAGE CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="👥",
-    layout="wide",
-)
-
-
-# ============================================================
-# APPLICATION HEADER
-# ============================================================
-
-st.title("👥 Human Head Counter")
-
-st.write(
-    "Upload a photograph of a classroom, meeting, or small group. "
-    "The AI model will estimate the number of visible human heads "
-    "and mark detected heads on the photograph."
-)
-
-st.caption(
-    "The result is an estimate, not an official attendance record. "
-    "Hidden, blurry, distant, or poorly lit heads may be missed. "
-    "Some objects may also be incorrectly identified as heads."
-)
-
-
-# ============================================================
-# LOAD THE AI MODEL
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def load_head_model():
-    """
-    Download and cache the pretrained head-detection model.
-
-    The Ultralytics import is delayed until the user runs a count,
-    helping the app display its interface before loading PyTorch.
-    """
-
-    from ultralytics import YOLO
-
-    weights_path = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename=MODEL_FILE,
     )
+    st.caption("Start at 0.25, then compare results with a manually counted photo.")
 
-    model = YOLO(weights_path)
-
-    return model
-
-
-# ============================================================
-# IMAGE PROCESSING FUNCTIONS
-# ============================================================
-
-def get_uploaded_image(upload_bytes: bytes) -> Image.Image:
-    """
-    Open an uploaded image, correct its orientation, and convert it
-    to RGB. Reject images that exceed the configured pixel limit.
-    """
-
-    with Image.open(io.BytesIO(upload_bytes)) as source_image:
-
-        width, height = source_image.size
-
-        if width < 1 or height < 1:
-            raise ValueError("The image has invalid dimensions.")
-
-        if width * height > MAX_IMAGE_PIXELS:
-            raise ValueError(
-                f"The image contains {width * height:,} pixels. "
-                f"Please upload an image containing no more than "
-                f"{MAX_IMAGE_PIXELS:,} pixels."
-            )
-
-        corrected_image = (
-            ImageOps.exif_transpose(source_image)
-            .convert("RGB")
-        )
-
-    return corrected_image
-
-
-def make_jpeg_bytes(image: Image.Image) -> bytes:
-    """Convert a PIL image into downloadable JPEG bytes."""
-
-    buffer = io.BytesIO()
-
-    image.save(
-        buffer,
-        format="JPEG",
-        quality=92,
-        optimize=True,
-    )
-
-    return buffer.getvalue()
-
-
-# ============================================================
-# SIDEBAR SETTINGS
-# ============================================================
-
-with st.sidebar:
-
-    st.header("Detection settings")
-
-    confidence_threshold = st.slider(
-        "Confidence threshold",
-        min_value=0.05,
-        max_value=0.80,
-        value=0.25,
-        step=0.05,
-        help=(
-            "Lower values may detect more heads but can create "
-            "false detections. Higher values are stricter but "
-            "may miss some heads."
-        ),
-    )
-
-    st.markdown("**Recommended starting point: 0.25**")
-
-    st.caption(
-        "The model runs on the CPU. The first analysis may take "
-        "longer because the model must be downloaded and loaded."
-    )
-
-
-# ============================================================
-# PHOTO UPLOAD
-# ============================================================
-
-uploaded_file = st.file_uploader(
-    "Choose a photograph",
+uploaded = st.file_uploader(
+    "Upload a photo",
     type=["jpg", "jpeg", "png", "webp"],
-    help=(
-        f"Maximum file size: {MAX_UPLOAD_MB} MB. "
-        "Supported formats: JPG, PNG, and WEBP."
-    ),
+    help=f"Maximum file size: {MAX_UPLOAD_MB} MB.",
 )
 
+image = None
+raw_bytes = None
+image_hash = None
 
-image: Image.Image | None = None
-upload_bytes: bytes | None = None
-upload_hash: str | None = None
-
-
-if uploaded_file is not None:
-
-    upload_bytes = uploaded_file.getvalue()
-
-    if len(upload_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-
-        st.error(
-            f"The file exceeds {MAX_UPLOAD_MB} MB. "
-            "Please upload a smaller photograph."
-        )
-
-        upload_bytes = None
-
+if uploaded is not None:
+    raw_bytes = uploaded.getvalue()
+    if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(f"File exceeds {MAX_UPLOAD_MB} MB. Please upload a smaller image.")
     else:
-
         try:
+            image = open_uploaded_image(raw_bytes)
+            image_hash = hashlib.sha256(raw_bytes).hexdigest()
+            st.image(image, caption="Uploaded photo", use_container_width=True)
+            st.caption(f"Image dimensions: {image.width:,} × {image.height:,} pixels")
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+            st.error(f"Could not open this image: {exc}")
 
-            image = get_uploaded_image(upload_bytes)
-
-            upload_hash = hashlib.sha256(
-                upload_bytes
-            ).hexdigest()
-
-            st.image(
-                image,
-                caption="Uploaded photograph",
-                use_container_width=True,
-            )
-
-            st.caption(
-                f"Image dimensions: {image.width:,} × "
-                f"{image.height:,} pixels"
-            )
-
-        except (
-            UnidentifiedImageError,
-            OSError,
-            ValueError,
-            Image.DecompressionBombError,
-        ) as exc:
-
-            st.error(f"Could not read this image: {exc}")
-
-            image = None
-            upload_hash = None
-
-
-# ============================================================
-# COUNT HEADS BUTTON
-# ============================================================
-
-count_button = st.button(
+run_count = st.button(
     "Count heads",
     type="primary",
-    disabled=(image is None or upload_hash is None),
     use_container_width=True,
+    disabled=(image is None),
 )
 
-
-# ============================================================
-# RUN HEAD DETECTION
-# ============================================================
-
-if (
-    count_button
-    and image is not None
-    and upload_hash is not None
-):
-
-    # Remove any previous result before starting a new analysis.
-    st.session_state.pop("last_result", None)
-
+if run_count and image is not None and image_hash is not None:
+    st.session_state.pop("head_count_result", None)
     try:
-
-        with st.spinner(
-            "Loading the AI model and detecting heads..."
-        ):
-
-            model = load_head_model()
-
-            start_time = time.perf_counter()
-
-            prediction = model.predict(
+        with st.spinner("Loading the model and detecting heads. The first run may take longer..."):
+            model = load_model()
+            started = time.perf_counter()
+            result = model.predict(
                 source=np.asarray(image),
-                imgsz=MODEL_IMAGE_SIZE,
-                conf=float(confidence_threshold),
-                iou=MODEL_IOU,
-                max_det=MAX_DETECTIONS,
+                imgsz=832,
+                conf=float(confidence),
+                iou=0.70,
+                max_det=300,
                 device="cpu",
                 verbose=False,
             )[0]
+            elapsed = time.perf_counter() - started
 
-            elapsed_seconds = (
-                time.perf_counter() - start_time
-            )
-
-            # Ultralytics returns the plotted image in BGR order.
-            annotated_bgr = prediction.plot(
-                boxes=True,
-                labels=True,
-                conf=True,
-            )
-
-            # Convert BGR to RGB for correct display in PIL.
-            annotated_rgb = np.ascontiguousarray(
-                annotated_bgr[:, :, ::-1]
-            )
-
-            annotated_image = Image.fromarray(
-                annotated_rgb
-            )
-
-            # Count the model's detected bounding boxes.
-            if prediction.boxes is None:
-                detection_count = 0
+            if result.boxes is None:
+                count = 0
             else:
-                detection_count = len(prediction.boxes)
+                count = len(result.boxes)
 
-            # Store the result for Streamlit reruns.
-            st.session_state["last_result"] = {
-                "upload_hash": upload_hash,
-                "count": int(detection_count),
-                "confidence": float(confidence_threshold),
-                "elapsed_seconds": float(elapsed_seconds),
-                "annotated_jpeg": make_jpeg_bytes(
-                    annotated_image
-                ),
-                "image_width": image.width,
-                "image_height": image.height,
-                "filename": (
-                    Path(uploaded_file.name).stem
-                    if uploaded_file
-                    else "photo"
-                ),
+            # Ultralytics plot() returns a BGR image; convert it to RGB for display.
+            marked_bgr = result.plot(boxes=True, labels=True, conf=True)
+            marked_rgb = np.ascontiguousarray(marked_bgr[:, :, ::-1])
+            marked_image = Image.fromarray(marked_rgb)
+
+            st.session_state["head_count_result"] = {
+                "image_hash": image_hash,
+                "count": int(count),
+                "confidence": float(confidence),
+                "seconds": float(elapsed),
+                "marked_jpeg": image_to_jpeg_bytes(marked_image),
+                "filename": uploaded.name.rsplit(".", 1)[0] if uploaded else "photo",
             }
-
     except Exception as exc:
+        st.error("The model could not process this photo.")
+        st.exception(exc)
 
-        st.error(
-            "The head-detection model could not process "
-            "this photograph. Please try again."
-        )
+result_data = st.session_state.get("head_count_result")
 
-        with st.expander("Technical details"):
-
-            st.code(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-
-# ============================================================
-# DISPLAY RESULTS
-# ============================================================
-
-last_result: dict[str, Any] | None = (
-    st.session_state.get("last_result")
-)
-
-
-if (
-    last_result
-    and upload_hash
-    and last_result.get("upload_hash") == upload_hash
-):
-
+if result_data and image_hash and result_data.get("image_hash") == image_hash:
     st.divider()
+    st.subheader("Results")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Estimated heads", result_data["count"])
+    col2.metric("Confidence threshold", f'{result_data["confidence"]:.2f}')
+    col3.metric("Detection time", f'{result_data["seconds"]:.2f} sec')
 
-    st.subheader("Counting result")
+    if abs(result_data["confidence"] - confidence) > 0.001:
+        st.info("You changed the confidence threshold. Click **Count heads** again to recalculate.")
 
-    metric_col, detail_col = st.columns([1, 2])
-
-    with metric_col:
-
-        st.metric(
-            "Detected heads (estimate)",
-            last_result["count"],
-        )
-
-    with detail_col:
-
-        st.write(
-            "**Confidence threshold:** "
-            f"{last_result['confidence']:.2f}"
-        )
-
-        st.write(
-            "**Processing time:** "
-            f"{last_result['elapsed_seconds']:.2f} seconds"
-        )
-
-        st.write(
-            "**Detection model:** YOLOv8n head detector"
-        )
-
-    if abs(
-        last_result["confidence"] - confidence_threshold
-    ) > 0.001:
-
-        st.info(
-            "The confidence threshold has changed since the "
-            "last analysis. Click Count heads again to "
-            "recalculate the result."
-        )
-
-    original_col, detected_col = st.columns(2)
-
+    original_col, marked_col = st.columns(2)
     with original_col:
-
+        st.image(image, caption="Original photo", use_container_width=True)
+    with marked_col:
         st.image(
-            image,
-            caption="Original photograph",
+            result_data["marked_jpeg"],
+            caption="Detected heads",
             use_container_width=True,
         )
 
-    with detected_col:
-
-        st.image(
-            last_result["annotated_jpeg"],
-            caption="Photograph with detected heads marked",
-            use_container_width=True,
-        )
-
-    # Provide the marked photograph as a download.
     st.download_button(
-        "Download photograph with head detections",
-        data=last_result["annotated_jpeg"],
-        file_name=(
-            f"{last_result['filename']}_head_counted.jpg"
-        ),
+        "Download marked photo",
+        data=result_data["marked_jpeg"],
+        file_name=f'{result_data["filename"]}_head_counted.jpg',
         mime="image/jpeg",
         use_container_width=True,
     )
-
 elif image is not None:
-
-    st.info(
-        "Click Count heads to analyze this photograph."
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
+    st.info("Click **Count heads** to analyze the photo.")
 
 st.divider()
-
 st.caption(
-    "Privacy: this application processes the photograph "
-    "on the app server. This code does not intentionally "
-    "save uploaded photographs to a database or permanent file. "
-    "Do not upload photos without appropriate authorization."
+    "Photos are processed by this app server. This script does not intentionally "
+    "save uploaded photos to a database or permanent file. Do not upload photos "
+    "without appropriate authorization."
 )
-
 st.caption(
-    "Licensing: the selected model lists CC BY-SA 4.0. "
-    "Ultralytics offers AGPL-3.0 or Enterprise licensing. "
-    "Review the applicable model and software licenses before "
+    "Review the head-detection model and Ultralytics licensing terms before "
     "commercial or proprietary use."
 )
