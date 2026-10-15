@@ -32,6 +32,7 @@ st.set_page_config(
 )
 
 st.title("Classroom Head Counter")
+
 st.write(
     "Upload a classroom photo to detect and count visible heads. "
     "The app analyzes overlapping sections to help find smaller "
@@ -59,8 +60,10 @@ def load_model():
 
     model = YOLO(model_path)
 
-    # This model has one class: human head.
-    model.names = {0: "head"}
+    # IMPORTANT:
+    # Do not assign to model.names.
+    # Ultralytics manages this read-only property.
+    # Preserve the original class names stored in the model.
 
     return model
 
@@ -87,7 +90,14 @@ def read_image(raw_bytes):
 
 def to_jpeg_bytes(image):
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=92, optimize=True)
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=92,
+        optimize=True,
+    )
+
     return output.getvalue()
 
 
@@ -97,13 +107,24 @@ def to_jpeg_bytes(image):
 
 def make_tiles(image):
     width, height = image.size
-    step = max(1, int(TILE_SIZE * (1 - TILE_OVERLAP)))
+
+    step = max(
+        1,
+        int(TILE_SIZE * (1 - TILE_OVERLAP)),
+    )
 
     def positions(length):
         if length <= TILE_SIZE:
             return [0]
 
-        values = list(range(0, length - TILE_SIZE + 1, step))
+        values = list(
+            range(
+                0,
+                length - TILE_SIZE + 1,
+                step,
+            )
+        )
+
         final_position = length - TILE_SIZE
 
         if values[-1] != final_position:
@@ -118,7 +139,10 @@ def make_tiles(image):
             right = min(x + TILE_SIZE, width)
             bottom = min(y + TILE_SIZE, height)
 
-            tile = image.crop((x, y, right, bottom))
+            tile = image.crop(
+                (x, y, right, bottom)
+            )
+
             tiles.append((x, y, tile))
 
     return tiles
@@ -129,10 +153,25 @@ def make_tiles(image):
 # =========================================================
 
 def calculate_iou(box, other_boxes):
-    x1 = np.maximum(box[0], other_boxes[:, 0])
-    y1 = np.maximum(box[1], other_boxes[:, 1])
-    x2 = np.minimum(box[2], other_boxes[:, 2])
-    y2 = np.minimum(box[3], other_boxes[:, 3])
+    x1 = np.maximum(
+        box[0],
+        other_boxes[:, 0],
+    )
+
+    y1 = np.maximum(
+        box[1],
+        other_boxes[:, 1],
+    )
+
+    x2 = np.minimum(
+        box[2],
+        other_boxes[:, 2],
+    )
+
+    y2 = np.minimum(
+        box[3],
+        other_boxes[:, 3],
+    )
 
     intersection = (
         np.maximum(0, x2 - x1)
@@ -145,36 +184,65 @@ def calculate_iou(box, other_boxes):
     )
 
     area_other = (
-        np.maximum(0, other_boxes[:, 2] - other_boxes[:, 0])
-        * np.maximum(0, other_boxes[:, 3] - other_boxes[:, 1])
+        np.maximum(
+            0,
+            other_boxes[:, 2] - other_boxes[:, 0],
+        )
+        *
+        np.maximum(
+            0,
+            other_boxes[:, 3] - other_boxes[:, 1],
+        )
     )
 
     union = area_box + area_other - intersection
 
-    return intersection / np.maximum(union, 1e-9)
+    return intersection / np.maximum(
+        union,
+        1e-9,
+    )
 
 
-def remove_duplicates(boxes, scores, iou_threshold=0.45):
+def remove_duplicates(
+    boxes,
+    scores,
+    iou_threshold=0.45,
+):
     if len(boxes) == 0:
         return []
 
-    boxes = np.asarray(boxes, dtype=np.float32)
-    scores = np.asarray(scores, dtype=np.float32)
+    boxes = np.asarray(
+        boxes,
+        dtype=np.float32,
+    )
+
+    scores = np.asarray(
+        scores,
+        dtype=np.float32,
+    )
 
     order = np.argsort(scores)[::-1]
+
     kept = []
 
     while len(order):
         current = order[0]
+
         kept.append(int(current))
 
         if len(order) == 1:
             break
 
         remaining = order[1:]
-        overlaps = calculate_iou(boxes[current], boxes[remaining])
 
-        order = remaining[overlaps < iou_threshold]
+        overlaps = calculate_iou(
+            boxes[current],
+            boxes[remaining],
+        )
+
+        order = remaining[
+            overlaps < iou_threshold
+        ]
 
     return kept
 
@@ -183,13 +251,23 @@ def remove_duplicates(boxes, scores, iou_threshold=0.45):
 # RUN DETECTION ON TILES
 # =========================================================
 
-def detect_heads(model, image, confidence, progress_bar):
+def detect_heads(
+    model,
+    image,
+    confidence,
+    progress_bar,
+):
     tiles = make_tiles(image)
 
     all_boxes = []
     all_scores = []
 
-    for tile_index, (offset_x, offset_y, tile) in enumerate(tiles):
+    for tile_index, (
+        offset_x,
+        offset_y,
+        tile,
+    ) in enumerate(tiles):
+
         prediction = model.predict(
             source=np.asarray(tile),
             imgsz=INFERENCE_SIZE,
@@ -200,37 +278,77 @@ def detect_heads(model, image, confidence, progress_bar):
             verbose=False,
         )[0]
 
-        if prediction.boxes is not None and len(prediction.boxes):
-            tile_boxes = prediction.boxes.xyxy.cpu().numpy()
-            tile_scores = prediction.boxes.conf.cpu().numpy()
+        if (
+            prediction.boxes is not None
+            and len(prediction.boxes)
+        ):
+            tile_boxes = (
+                prediction.boxes.xyxy.cpu().numpy()
+            )
 
-            for box, score in zip(tile_boxes, tile_scores):
-                x1, y1, x2, y2 = map(float, box)
+            tile_scores = (
+                prediction.boxes.conf.cpu().numpy()
+            )
 
-                # Convert tile coordinates to original-image coordinates.
+            for box, score in zip(
+                tile_boxes,
+                tile_scores,
+            ):
+                x1, y1, x2, y2 = map(
+                    float,
+                    box,
+                )
+
+                # Convert tile coordinates to
+                # original-image coordinates.
                 x1 += offset_x
                 x2 += offset_x
+
                 y1 += offset_y
                 y2 += offset_y
 
-                # Keep all coordinates inside the original image.
-                x1 = max(0, min(x1, image.width))
-                x2 = max(0, min(x2, image.width))
-                y1 = max(0, min(y1, image.height))
-                y2 = max(0, min(y2, image.height))
+                # Keep coordinates inside the image.
+                x1 = max(
+                    0,
+                    min(x1, image.width),
+                )
+
+                x2 = max(
+                    0,
+                    min(x2, image.width),
+                )
+
+                y1 = max(
+                    0,
+                    min(y1, image.height),
+                )
+
+                y2 = max(
+                    0,
+                    min(y2, image.height),
+                )
 
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                all_boxes.append([x1, y1, x2, y2])
-                all_scores.append(float(score))
+                all_boxes.append(
+                    [x1, y1, x2, y2]
+                )
+
+                all_scores.append(
+                    float(score)
+                )
 
         progress_bar.progress(
             (tile_index + 1) / len(tiles),
-            text=f"Analyzing tile {tile_index + 1} of {len(tiles)}...",
+            text=(
+                f"Analyzing tile {tile_index + 1} "
+                f"of {len(tiles)}..."
+            ),
         )
 
-    # Remove duplicate detections created by overlapping tiles.
+    # Remove duplicate detections created by
+    # overlapping tiles.
     kept_indices = remove_duplicates(
         all_boxes,
         all_scores,
@@ -238,25 +356,39 @@ def detect_heads(model, image, confidence, progress_bar):
     )
 
     annotated = image.copy()
+
     draw = ImageDraw.Draw(annotated)
 
     for index in kept_indices:
         x1, y1, x2, y2 = all_boxes[index]
+
         score = all_scores[index]
 
         draw.rectangle(
-            (int(x1), int(y1), int(x2), int(y2)),
+            (
+                int(x1),
+                int(y1),
+                int(x2),
+                int(y2),
+            ),
             outline="#00FF00",
             width=3,
         )
 
         draw.text(
-            (int(x1) + 2, max(0, int(y1) - 16)),
+            (
+                int(x1) + 2,
+                max(0, int(y1) - 16),
+            ),
             f"Head {score:.2f}",
             fill="#00FF00",
         )
 
-    return len(kept_indices), annotated, len(tiles)
+    return (
+        len(kept_indices),
+        annotated,
+        len(tiles),
+    )
 
 
 # =========================================================
@@ -284,8 +416,14 @@ with st.sidebar:
     )
 
     st.write("**Image processing**")
-    st.write(f"Tile size: {TILE_SIZE} × {TILE_SIZE}")
-    st.write(f"Tile overlap: {int(TILE_OVERLAP * 100)}%")
+
+    st.write(
+        f"Tile size: {TILE_SIZE} × {TILE_SIZE}"
+    )
+
+    st.write(
+        f"Tile overlap: {int(TILE_OVERLAP * 100)}%"
+    )
 
 
 # =========================================================
@@ -294,7 +432,12 @@ with st.sidebar:
 
 uploaded = st.file_uploader(
     "Upload classroom photo",
-    type=["jpg", "jpeg", "png", "webp"],
+    type=[
+        "jpg",
+        "jpeg",
+        "png",
+        "webp",
+    ],
     help="Maximum file size: 20 MB.",
 )
 
@@ -305,11 +448,17 @@ if uploaded is not None:
     raw_bytes = uploaded.getvalue()
 
     if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-        st.error("The uploaded file exceeds 20 MB.")
+        st.error(
+            "The uploaded file exceeds 20 MB."
+        )
+
     else:
         try:
             image = read_image(raw_bytes)
-            image_digest = hashlib.sha256(raw_bytes).hexdigest()
+
+            image_digest = hashlib.sha256(
+                raw_bytes
+            ).hexdigest()
 
             st.image(
                 image,
@@ -328,7 +477,9 @@ if uploaded is not None:
             ValueError,
             Image.DecompressionBombError,
         ) as error:
-            st.error(f"Unable to read the image: {error}")
+            st.error(
+                f"Unable to read the image: {error}"
+            )
 
 
 # =========================================================
@@ -341,15 +492,23 @@ if st.button(
     use_container_width=True,
     disabled=image is None,
 ):
-    st.session_state.pop("head_result", None)
+    st.session_state.pop(
+        "head_result",
+        None,
+    )
 
-    progress = st.progress(0, text="Starting detection...")
+    progress = st.progress(
+        0,
+        text="Starting detection...",
+    )
 
     try:
         with st.spinner(
-            "Loading the head-detection model and analyzing the photo..."
+            "Loading the head-detection model "
+            "and analyzing the photo..."
         ):
             model = load_model()
+
             start_time = time.perf_counter()
 
             count, annotated, tile_count = detect_heads(
@@ -359,7 +518,9 @@ if st.button(
                 progress_bar=progress,
             )
 
-            elapsed = time.perf_counter() - start_time
+            elapsed = (
+                time.perf_counter() - start_time
+            )
 
             st.session_state["head_result"] = {
                 "digest": image_digest,
@@ -367,12 +528,18 @@ if st.button(
                 "confidence": float(confidence),
                 "elapsed": float(elapsed),
                 "tiles": int(tile_count),
-                "annotated": to_jpeg_bytes(annotated),
-                "filename": uploaded.name.rsplit(".", 1)[0],
+                "annotated": to_jpeg_bytes(
+                    annotated
+                ),
+                "filename": uploaded.name.rsplit(
+                    ".",
+                    1,
+                )[0],
             }
 
     except Exception as error:
         st.error("Head detection failed.")
+
         st.exception(error)
 
     finally:
@@ -383,7 +550,9 @@ if st.button(
 # SHOW RESULTS
 # =========================================================
 
-result = st.session_state.get("head_result")
+result = st.session_state.get(
+    "head_result"
+)
 
 if (
     result is not None
@@ -391,16 +560,29 @@ if (
     and result["digest"] == image_digest
 ):
     st.divider()
+
     st.subheader("Detection results")
 
     col1, col2, col3 = st.columns(3)
 
-    col1.metric("Estimated heads", result["count"])
-    col2.metric("Confidence threshold", f'{result["confidence"]:.2f}')
-    col3.metric("Processing time", f'{result["elapsed"]:.1f} sec')
+    col1.metric(
+        "Estimated heads",
+        result["count"],
+    )
+
+    col2.metric(
+        "Confidence threshold",
+        f'{result["confidence"]:.2f}',
+    )
+
+    col3.metric(
+        "Processing time",
+        f'{result["elapsed"]:.1f} sec',
+    )
 
     st.caption(
-        f'Image analyzed in {result["tiles"]} overlapping tiles.'
+        f'Image analyzed in {result["tiles"]} '
+        f'overlapping tiles.'
     )
 
     original_col, result_col = st.columns(2)
@@ -422,15 +604,18 @@ if (
     st.download_button(
         "Download annotated photo",
         data=result["annotated"],
-        file_name=f'{result["filename"]}_head_counted.jpg',
+        file_name=(
+            f'{result["filename"]}_head_counted.jpg'
+        ),
         mime="image/jpeg",
         use_container_width=True,
     )
 
     st.warning(
-        "Review the boxes before using this count for attendance. "
-        "A box can still be a false detection, and some heads may "
-        "be missed even with this dedicated model."
+        "Review the boxes before using this count for "
+        "attendance. A box can still be a false detection, "
+        "and some heads may be missed even with this "
+        "dedicated model."
     )
 
 
@@ -442,7 +627,8 @@ st.divider()
 
 st.caption(
     "This app estimates visible heads, not verified attendance. "
-    "Occlusion, head coverings, lighting, and camera angle can affect accuracy."
+    "Occlusion, head coverings, lighting, and camera angle can "
+    "affect accuracy."
 )
 
 st.caption(
@@ -451,5 +637,6 @@ st.caption(
 )
 
 st.caption(
-    "Model license: AGPL-3.0. Review its terms before commercial deployment."
+    "Model license: AGPL-3.0. Review its terms before "
+    "commercial deployment."
 )
