@@ -5,24 +5,27 @@ import numpy as np
 from ultralytics import YOLO
 
 # --- Page config ---
-st.set_page_config(page_title="Human Head Counter", page_icon="👤", layout="centered")
+st.set_page_config(
+    page_title="Human Head Counter",
+    page_icon="👤",
+    layout="centered"
+)
 
 # --- Load model (cached so it only loads once) ---
 @st.cache_resource
 def load_model():
     """
-    Load YOLOv8n. Auto-downloads on first run.
-    
-    To use a head-specific model later:
-    1. Upload your .pt file (e.g. 'v8s-head.pt') to your GitHub repo.
-    2. Change the line below to: return YOLO("v8s-head.pt")
+    Load the YOLO head-detection model.
+    The model file 'v8s-head.pt' must be in the same directory as this script.
+    Download it from: https://huggingface.co/Xulee-0806/YOLO-head-detection
     """
-    return YOLO("yolov8n.pt")
+    return YOLO("v8s-head.pt")
 
 try:
     model = load_model()
 except Exception as e:
     st.error(f"Failed to load model: {e}")
+    st.error("Make sure 'v8s-head.pt' is in the same folder as this app.py file.")
     st.stop()
 
 # --- Sidebar controls ---
@@ -33,13 +36,22 @@ with st.sidebar:
         min_value=0.05, max_value=0.95, value=0.25, step=0.05,
         help="Lower = more detections (may include false positives)."
     )
-    show_others = st.checkbox("Show all objects (not just people)", value=False)
+    st.info(
+        "Model: `v8s-head.pt` (YOLOv8s fine-tuned for head detection). "
+        "Fast and accurate for crowd counting."
+    )
 
 # --- UI ---
 st.title("👤 Human Head Counter")
-st.write("Upload a photo and the app will count the people it detects.")
+st.write(
+    "Upload a photo and the app will count the number of human heads "
+    "it detects using a YOLOv8 model fine-tuned for head detection."
+)
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "webp"])
+uploaded_file = st.file_uploader(
+    "Choose an image...",
+    type=["jpg", "jpeg", "png", "webp"]
+)
 
 if uploaded_file is not None:
     try:
@@ -49,18 +61,16 @@ if uploaded_file is not None:
         st.stop()
 
     col1, col2 = st.columns(2)
+
     with col1:
-        st.subheader("📷 Original")
+        st.subheader("📷 Original Image")
         st.image(image, use_column_width=True)
 
-    if st.button("🔍 Count People", use_container_width=True):
-        with st.spinner("Detecting..."):
-            # Run inference. If not showing others, restrict to class 0 (person).
+    if st.button("🔍 Count Heads", use_container_width=True):
+        with st.spinner("Detecting heads..."):
             try:
-                if show_others:
-                    results = model(image, conf=confidence, verbose=False)
-                else:
-                    results = model(image, conf=confidence, classes=[0], verbose=False)
+                # Run inference. The head model has only one class (head).
+                results = model(image, conf=confidence, imgsz=640, verbose=False)
             except Exception as e:
                 st.error(f"Detection failed: {e}")
                 st.stop()
@@ -74,9 +84,13 @@ if uploaded_file is not None:
                 annotated = annotated[:, :, ::-1]
 
             with col2:
-                st.subheader("✅ Result")
-                st.metric(label="Detected", value=count)
-                st.image(annotated, caption=f"{count} detected", use_column_width=True)
+                st.subheader("✅ Detection Result")
+                st.metric(label="Heads Detected", value=count)
+                st.image(
+                    annotated,
+                    caption=f"Detected {count} head(s)",
+                    use_column_width=True
+                )
 
             # Details table
             with st.expander("Show detection details"):
@@ -85,13 +99,14 @@ if uploaded_file is not None:
                     for i, box in enumerate(boxes):
                         xyxy = box.xyxy[0].tolist()
                         conf = float(box.conf)
-                        cls_id = int(box.cls)
                         rows.append({
                             "ID": i + 1,
                             "Confidence": f"{conf:.3f}",
-                            "Class": model.names.get(cls_id, str(cls_id)),
                             "Box (x1,y1,x2,y2)": [round(c, 1) for c in xyxy],
                         })
                     st.dataframe(rows, use_container_width=True)
                 else:
-                    st.info("No objects detected. Try lowering the confidence threshold.")
+                    st.info(
+                        "No heads detected. Try lowering the confidence "
+                        "threshold in the sidebar."
+                    )
